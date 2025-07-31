@@ -1,0 +1,172 @@
+service: triathlon-system
+# frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: ap-northeast-1
+  stage: dev
+  
+  environment:
+    ATHLETES_TABLE: ${self:service}-athletes-${self:provider.stage}
+    TEMPERATURE_TABLE: ${self:service}-temperature-${self:provider.stage}
+    JWT_SECRET: triathlon-jwt-secret-2025
+  
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource:
+            - Fn::GetAtt: [ AthletesTable, Arn ]
+            - Fn::GetAtt: [ TemperatureTable, Arn ]
+            - Fn::Join: ['/', [Fn::GetAtt: [ AthletesTable, Arn ], 'index', '*']]
+
+functions:
+  # テスト用
+  hello:
+    handler: handler.hello
+    events:
+      - httpApi:
+          path: /
+          method: get
+          cors: true
+
+  # 認証
+  login:
+    handler: src/auth.login
+    events:
+      - httpApi:
+          path: /auth/login
+          method: post
+          cors: true
+
+  # 選手用API
+  getProfile:
+    handler: src/athlete.getProfile
+    events:
+      - httpApi:
+          path: /athlete/profile
+          method: get
+          cors: true
+
+  getTemperatureData:
+    handler: src/athlete.getTemperatureData
+    events:
+      - httpApi:
+          path: /athlete/temperature-data
+          method: get
+          cors: true
+
+  # 管理者用API
+  uploadAthletes:
+    handler: src/admin.uploadAthletes
+    timeout: 30
+    events:
+      - httpApi:
+          path: /admin/athletes
+          method: post
+          cors: true
+
+  uploadTemperatureData:
+    handler: src/admin.uploadTemperatureData
+    timeout: 30
+    events:
+      - httpApi:
+          path: /admin/temperature
+          method: post
+          cors: true
+
+  getStats:
+    handler: src/admin.getStats
+    events:
+      - httpApi:
+          path: /admin/stats
+          method: get
+          cors: true
+  
+  # 管理者認証
+  adminLogin:
+    handler: src/auth.adminLogin
+    events:
+      - httpApi:
+          path: /admin/login
+          method: post
+          cors: true
+
+  # 管理者用API
+  getAllAthletes:
+    handler: src/admin.getAllAthletes
+    events:
+      - httpApi:
+          path: /admin/athletes
+          method: get
+          cors: true
+
+  getAthleteData:
+    handler: src/admin.getAthleteData
+    events:
+      - httpApi:
+          path: /admin/athletes/{halshare_id}/data
+          method: get
+          cors: true
+
+  createAthlete:
+    handler: src/admin.createAthlete
+    events:
+      - httpApi:
+          path: /admin/athletes/create
+          method: post
+          cors: true
+
+resources:
+  Resources:
+    AthletesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ATHLETES_TABLE}
+        AttributeDefinitions:
+          - AttributeName: email
+            AttributeType: S
+          - AttributeName: halshare_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: email
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: halshare-id-index
+            KeySchema:
+              - AttributeName: halshare_id
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        BillingMode: PAY_PER_REQUEST
+
+    TemperatureTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.TEMPERATURE_TABLE}
+        AttributeDefinitions:
+          - AttributeName: halshare_id
+            AttributeType: S
+          - AttributeName: datetime
+            AttributeType: S
+        KeySchema:
+          - AttributeName: halshare_id
+            KeyType: HASH
+          - AttributeName: datetime
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+
+plugins:
+  - serverless-offline
+
+custom:
+  serverless-offline:
+    httpPort: 3001
