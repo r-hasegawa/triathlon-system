@@ -5,7 +5,6 @@ import LoginView from './components/auth/LoginView'
 import AdminLoginView from './components/auth/AdminLoginView'
 import DashboardView from './components/dashboard/DashboardView'
 import AdminDashboardView from './components/admin/AdminDashboardView'
-import './App.css'
 
 function App() {
   const [currentView, setCurrentView] = useState('home')

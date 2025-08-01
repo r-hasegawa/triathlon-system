@@ -6,11 +6,16 @@ provider:
   runtime: nodejs18.x
   region: ap-northeast-1
   stage: dev
+  httpApi:
+    cors: true
   
   environment:
     ATHLETES_TABLE: ${self:service}-athletes-${self:provider.stage}
     TEMPERATURE_TABLE: ${self:service}-temperature-${self:provider.stage}
     JWT_SECRET: triathlon-jwt-secret-2025
+    DYNAMODB_ENDPOINT: ${env:DYNAMODB_ENDPOINT, 'http://localhost:8000'}
+    IS_LOCAL: ${env:IS_LOCAL, 'true'}
+    AWS_REGION: us-east-1
   
   iam:
     role:
@@ -23,6 +28,8 @@ provider:
             - dynamodb:PutItem
             - dynamodb:UpdateItem
             - dynamodb:DeleteItem
+            - dynamodb:BatchGetItem
+            - dynamodb:BatchWriteItem
           Resource:
             - Fn::GetAtt: [ AthletesTable, Arn ]
             - Fn::GetAtt: [ TemperatureTable, Arn ]
@@ -36,7 +43,6 @@ functions:
       - httpApi:
           path: /
           method: get
-          cors: true
 
   # 認証
   login:
@@ -45,7 +51,6 @@ functions:
       - httpApi:
           path: /auth/login
           method: post
-          cors: true
 
   # 選手用API
   getProfile:
@@ -54,7 +59,6 @@ functions:
       - httpApi:
           path: /athlete/profile
           method: get
-          cors: true
 
   getTemperatureData:
     handler: src/athlete.getTemperatureData
@@ -62,7 +66,6 @@ functions:
       - httpApi:
           path: /athlete/temperature-data
           method: get
-          cors: true
 
   # 管理者用API
   uploadAthletes:
@@ -72,7 +75,6 @@ functions:
       - httpApi:
           path: /admin/athletes
           method: post
-          cors: true
 
   uploadTemperatureData:
     handler: src/admin.uploadTemperatureData
@@ -81,7 +83,6 @@ functions:
       - httpApi:
           path: /admin/temperature
           method: post
-          cors: true
 
   getStats:
     handler: src/admin.getStats
@@ -89,7 +90,6 @@ functions:
       - httpApi:
           path: /admin/stats
           method: get
-          cors: true
   
   # 管理者認証
   adminLogin:
@@ -98,7 +98,6 @@ functions:
       - httpApi:
           path: /admin/login
           method: post
-          cors: true
 
   # 管理者用API
   getAllAthletes:
@@ -107,7 +106,6 @@ functions:
       - httpApi:
           path: /admin/athletes
           method: get
-          cors: true
 
   getAthleteData:
     handler: src/admin.getAthleteData
@@ -115,7 +113,6 @@ functions:
       - httpApi:
           path: /admin/athletes/{halshare_id}/data
           method: get
-          cors: true
 
   createAthlete:
     handler: src/admin.createAthlete
@@ -123,7 +120,6 @@ functions:
       - httpApi:
           path: /admin/athletes/create
           method: post
-          cors: true
 
 resources:
   Resources:
@@ -170,3 +166,4 @@ plugins:
 custom:
   serverless-offline:
     httpPort: 3001
+    timeout: 120

@@ -1,12 +1,22 @@
-const AWS = require('aws-sdk');
 const bcrypt = require('bcryptjs');
 const Papa = require('papaparse');
 const { success, error } = require('./utils/response');
+const { verify, extractToken } = require('./utils/jwt');
+const db = require('./data/dynamodb');
 
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+const authenticate = (event) => {
+  const token = extractToken(event);
+  if (!token) return null;
+  return verify(token);
+};
 
 exports.uploadAthletes = async (event) => {
   try {
+    const user = authenticate(event);
+    if (!user || user.role !== 'admin') {
+      return error(403, '管理者権限が必要です');
+    }
+
     const { csvData } = JSON.parse(event.body || '{}');
     
     if (!csvData) {
@@ -15,36 +25,47 @@ exports.uploadAthletes = async (event) => {
 
     console.log('選手データCSV受信');
 
-    // CSV解析
     const parsed = Papa.parse(csvData, {
       header: true,
-      skipEmptyLines: true
+      skipEmptyLines: true,
+      fastMode: true
     });
 
     if (parsed.errors.length > 0) {
-      return error(400, 'CSV解析エラー: ' + parsed.errors[0].message);
+      console.warn('CSV解析警告:', parsed.errors);
     }
 
     const athletes = [];
     for (const row of parsed.data) {
       const athlete = {
-        email: (row.email || row.loginId || '').toLowerCase(),
-        name: row.name || row.athleteName || '',
-        bib_number: row.bib_number || row.bibNumber || '',
-        halshare_id: row.halshare_id || row.halshareId || '',
-        created_at: new Date().toISOString()
+        email: (row.email || `${row.halshareId}@triathlon.local`).toLowerCase(),
+        name: row.halshareWearerName || row.name || `選手_${row.halshareId}`,
+        bib_number: row.bib_number || row.bibNumber || Math.floor(Math.random() * 1000).toString(),
+        halshare_id: row.halshareId || row.halshare_id || '',
+        password_hash: bcrypt.hashSync('password123', 10)
       };
 
-      if (athlete.email && athlete.halshare_id) {
+      if (athlete.halshare_id) {
         athletes.push(athlete);
       }
     }
 
-    console.log(`${athletes.length}名の選手データを処理`);
+    // DynamoDBに並行で選手を作成
+    const athletePromises = athletes.map(athlete => 
+      db.createAthlete(athlete).catch(err => {
+        console.warn(`選手作成スキップ: ${athlete.email}`, err.message);
+        return null;
+      })
+    );
+    
+    const results = await Promise.all(athletePromises);
+    const successCount = results.filter(r => r !== null).length;
+
+    console.log(`${successCount}名の選手データを処理`);
 
     return success({
-      message: `${athletes.length}名の選手データをアップロードしました`,
-      count: athletes.length,
+      message: `${successCount}名の選手データをアップロードしました`,
+      count: successCount,
       athletes: athletes.map(a => ({
         email: a.email,
         name: a.name,
@@ -61,65 +82,225 @@ exports.uploadAthletes = async (event) => {
 
 exports.uploadTemperatureData = async (event) => {
   try {
+    const user = authenticate(event);
+    if (!user || user.role !== 'admin') {
+      return error(403, '管理者権限が必要です');
+    }
+
     const { csvData } = JSON.parse(event.body || '{}');
     
     if (!csvData) {
       return error(400, 'CSVデータが必要です');
     }
 
-    console.log('体表温データCSV受信');
+    console.log('DynamoDB高速処理開始');
+    const startTime = Date.now();
 
+    // ダブルクォーテーション対応のCSV解析設定
     const parsed = Papa.parse(csvData, {
       header: true,
-      skipEmptyLines: true
+      skipEmptyLines: true,
+      // fastMode: false,  // fastModeを無効にしてクォート処理を有効化
+      dynamicTyping: true,
+      // クォート処理を明示的に有効化
+      quoteChar: '"',
+      delimiter: ',',
+      // ヘッダーと値のトリム処理
+      transformHeader: (header) => header.trim(),
+      transform: (value) => {
+        if (typeof value === 'string') {
+          return value.trim();
+        }
+        return value;
+      },
+      // エラー処理を寛容に
+      errors: 'first'
     });
 
-    if (parsed.errors.length > 0) {
-      return error(400, 'CSV解析エラー: ' + parsed.errors[0].message);
-    }
-
-    const temperatureData = [];
-    for (const row of parsed.data) {
-      const dataPoint = {
-        halshare_id: (row.halshareId || row.halshare_id || '').toString(),
-        datetime: row.datetime || '',
-        temperature: parseFloat(row.temperature) || 0,
-        created_at: new Date().toISOString()
-      };
-
-      if (dataPoint.halshare_id && dataPoint.datetime && dataPoint.temperature > 0) {
-        temperatureData.push(dataPoint);
+    // CSV解析エラーの詳細チェック
+    if (parsed.errors && parsed.errors.length > 0) {
+      console.warn('CSV解析警告:', parsed.errors);
+      // 致命的なエラーのみで停止
+      const fatalErrors = parsed.errors.filter(err => err.type === 'Delimiter' || err.type === 'Quote');
+      if (fatalErrors.length > 0) {
+        return error(400, `CSV解析エラー: ${fatalErrors[0].message}`);
       }
     }
 
-    console.log(`${temperatureData.length}件の体表温データを処理`);
+    console.log(`CSV解析完了: ${parsed.data.length}行 (${Date.now() - startTime}ms)`);
+    
+    // デバッグ用: 最初の数行のデータ構造を確認
+    if (parsed.data.length > 0) {
+      console.log('CSV ヘッダー:', Object.keys(parsed.data[0]));
+      console.log('サンプルデータ:', parsed.data.slice(0, 2));
+    }
+
+    const temperatureData = [];
+    const athletesToCreate = [];
+    const existingAthletes = new Set();
+    let validCount = 0;
+    let processedCount = 0;
+    let invalidRows = [];
+
+    // データ検証と準備（より柔軟なフィールド名対応）
+    for (const row of parsed.data) {
+      processedCount++;
+      
+      // 進捗表示（1000行ごと）
+      if (processedCount % 1000 === 0) {
+        console.log(`処理進捗: ${processedCount}/${parsed.data.length}`);
+      }
+
+      // フィールド名の柔軟な対応（大小文字、スペース、アンダースコア等）
+      let halshareId = '';
+      let datetime = '';
+      let temperature = 0;
+      let wearerName = '';
+
+      // halshareId の取得（複数のフィールド名に対応）
+      const halshareFields = ['halshareId', 'halshare_id', 'HalshareId', 'HALSHARE_ID'];
+      for (const field of halshareFields) {
+        if (row[field]) {
+          halshareId = String(row[field]).trim().replace(/"/g, ''); // クォート除去
+          break;
+        }
+      }
+
+      // datetime の取得
+      const datetimeFields = ['datetime', 'date_time', 'DateTime', 'DATE_TIME', 'timestamp'];
+      for (const field of datetimeFields) {
+        if (row[field]) {
+          datetime = String(row[field]).trim().replace(/"/g, '');
+          break;
+        }
+      }
+
+      // temperature の取得
+      const tempFields = ['temperature', 'temp', 'Temperature', 'TEMPERATURE'];
+      for (const field of tempFields) {
+        if (row[field] !== undefined && row[field] !== null && row[field] !== '') {
+          const tempValue = String(row[field]).trim().replace(/"/g, '');
+          temperature = parseFloat(tempValue);
+          break;
+        }
+      }
+
+      // wearerName の取得
+      const nameFields = ['halshareWearerName', 'wearer_name', 'name', 'WearerName', 'WEARER_NAME'];
+      for (const field of nameFields) {
+        if (row[field]) {
+          wearerName = String(row[field]).trim().replace(/"/g, '');
+          break;
+        }
+      }
+
+      // データ検証（より詳細な検証）
+      let isValid = true;
+      let invalidReason = '';
+
+      if (!halshareId) {
+        isValid = false;
+        invalidReason = 'halshareId が空';
+      } else if (!datetime) {
+        isValid = false;
+        invalidReason = 'datetime が空';
+      } else if (isNaN(temperature) || temperature <= 0) {
+        isValid = false;
+        invalidReason = `temperature が無効: ${row[tempFields.find(f => row[f])]}`;
+      } else if (temperature < 20 || temperature > 50) {
+        isValid = false;
+        invalidReason = `temperature が範囲外: ${temperature}°C`;
+      }
+
+      if (isValid) {
+        const dataPoint = {
+          halshare_id: halshareId,
+          datetime: datetime,
+          temperature: temperature
+        };
+
+        temperatureData.push(dataPoint);
+        validCount++;
+
+        // 新しい選手の準備（重複チェック）
+        if (!existingAthletes.has(halshareId)) {
+          existingAthletes.add(halshareId);
+          
+          try {
+            const existingAthlete = await db.findAthleteByHalshareId(halshareId);
+            if (!existingAthlete) {
+              athletesToCreate.push({
+                email: `${halshareId}@triathlon.local`,
+                halshare_id: halshareId,
+                name: wearerName || `選手_${halshareId}`,
+                bib_number: String(Math.floor(Math.random() * 1000)).padStart(3, '0'),
+                password_hash: bcrypt.hashSync('password123', 10)
+              });
+            }
+          } catch (err) {
+            console.warn(`選手チェックエラー: ${halshareId}`, err.message);
+          }
+        }
+      } else {
+        // 無効な行の詳細を記録（最初の10件まで）
+        if (invalidRows.length < 10) {
+          invalidRows.push({
+            row: processedCount,
+            reason: invalidReason,
+            data: row
+          });
+        }
+      }
+    }
+
+    console.log(`データ準備完了: ${validCount}件, 新規選手: ${athletesToCreate.length}名 (${Date.now() - startTime}ms)`);
+    
+    if (invalidRows.length > 0) {
+      console.warn('無効な行の例:', invalidRows);
+    }
+
+    // 選手を並行作成
+    const athletePromises = athletesToCreate.map(athlete => 
+      db.createAthlete(athlete).catch(err => {
+        console.warn(`選手作成スキップ: ${athlete.halshare_id}`, err.message);
+        return null;
+      })
+    );
+    
+    const athleteResults = await Promise.all(athletePromises);
+    const newAthletesCount = athleteResults.filter(r => r !== null).length;
+
+    console.log(`選手作成完了: ${newAthletesCount}名 (${Date.now() - startTime}ms)`);
+
+    // 体表温データを高速バッチ挿入
+    if (temperatureData.length > 0) {
+      await db.batchInsertTemperatureData(temperatureData);
+    }
+
+    const processingTime = Date.now() - startTime;
+    console.log(`DynamoDB処理完了: ${processingTime}ms`);
 
     return success({
-      message: `${temperatureData.length}件の体表温データをアップロードしました`,
-      count: temperatureData.length
+      message: `${validCount}件の体表温データをアップロードしました`,
+      newAthletesCreated: `${newAthletesCount}名の選手を自動作成しました`,
+      count: validCount,
+      totalProcessed: processedCount,
+      invalidRows: processedCount - validCount,
+      processingTimeMs: processingTime,
+      performance: {
+        recordsPerSecond: Math.round(validCount / (processingTime / 1000)),
+        database: 'DynamoDB Local'
+      },
+      sample_data: temperatureData.slice(0, 3),
+      validation_errors: invalidRows.length > 0 ? invalidRows : undefined
     });
 
   } catch (err) {
-    console.error('体表温アップロードエラー:', err);
-    return error(500, 'サーバーエラーが発生しました');
+    console.error('DynamoDBアップロードエラー:', err);
+    return error(500, `処理エラー: ${err.message}`);
   }
 };
 
-exports.getStats = async (event) => {
-  try {
-    return success({
-      athletes_count: 3,
-      temperature_records: 150,
-      last_updated: new Date().toISOString()
-    });
-
-  } catch (err) {
-    console.error('統計取得エラー:', err);
-    return error(500, 'サーバーエラーが発生しました');
-  }
-};
-
-// 全選手データ取得
 exports.getAllAthletes = async (event) => {
   try {
     const user = authenticate(event);
@@ -127,26 +308,8 @@ exports.getAllAthletes = async (event) => {
       return error(403, '管理者権限が必要です');
     }
 
-    // テスト用ダミーデータ
-    const athletes = [
-      {
-        email: 'test@example.com',
-        name: 'テスト選手',
-        bib_number: '001',
-        halshare_id: '110000021B17',
-        last_data_time: '2025-07-28 07:48:44',
-        data_count: 50
-      },
-      {
-        email: 'athlete2@example.com', 
-        name: '田中太郎',
-        bib_number: '002',
-        halshare_id: '110000021B18',
-        last_data_time: '2025-07-28 08:15:22',
-        data_count: 45
-      }
-    ];
-
+    const athletes = await db.getAllAthletes();
+    
     return success({
       athletes: athletes,
       total: athletes.length
@@ -158,7 +321,6 @@ exports.getAllAthletes = async (event) => {
   }
 };
 
-// 特定選手のデータ取得
 exports.getAthleteData = async (event) => {
   try {
     const user = authenticate(event);
@@ -171,33 +333,27 @@ exports.getAthleteData = async (event) => {
       return error(400, 'halshare_idが必要です');
     }
 
-    // テスト用ダミーデータ生成
-    const testData = [];
-    const startTime = new Date('2025-07-26 09:00:00');
-    
-    for (let i = 0; i < 60; i++) {
-      const time = new Date(startTime.getTime() + i * 5 * 60000);
-      const baseTemp = 36.5 + Math.sin(i * 0.15) * 0.9;
-      const randomVariation = (Math.random() - 0.5) * 0.5;
-      
-      testData.push({
-        halshare_id: halshare_id,
-        datetime: time.toISOString().replace('T', ' ').slice(0, 19),
-        temperature: Math.round((baseTemp + randomVariation) * 10) / 10
-      });
+    const athleteData = await db.getTemperatureDataByHalshareId(halshare_id);
+
+    if (athleteData.length === 0) {
+      return error(404, '指定された選手のデータが見つかりません');
     }
 
-    const temperatures = testData.map(item => item.temperature);
+    const temperatures = athleteData.map(item => item.temperature);
     const stats = {
       min: Math.min(...temperatures),
       max: Math.max(...temperatures),
       avg: Math.round((temperatures.reduce((a, b) => a + b, 0) / temperatures.length) * 10) / 10,
-      count: temperatures.length
+      count: temperatures.length,
+      date_range: {
+        start: athleteData[0].datetime,
+        end: athleteData[athleteData.length - 1].datetime
+      }
     };
 
     return success({
       halshare_id: halshare_id,
-      data: testData,
+      data: athleteData,
       stats: stats
     });
 
@@ -207,7 +363,30 @@ exports.getAthleteData = async (event) => {
   }
 };
 
-// 選手アカウント作成
+exports.getStats = async (event) => {
+  try {
+    const user = authenticate(event);
+    if (!user || user.role !== 'admin') {
+      return error(403, '管理者権限が必要です');
+    }
+
+    const stats = await db.getSystemStats();
+    
+    return success({
+      athletes_count: stats.athletes_count,
+      temperature_records: stats.temperature_records,
+      last_updated: stats.last_updated,
+      data_summary: {
+        unique_devices: stats.unique_devices || 0
+      }
+    });
+
+  } catch (err) {
+    console.error('統計取得エラー:', err);
+    return error(500, 'サーバーエラーが発生しました');
+  }
+};
+
 exports.createAthlete = async (event) => {
   try {
     const user = authenticate(event);
@@ -221,16 +400,33 @@ exports.createAthlete = async (event) => {
       return error(400, '全ての項目が必要です');
     }
 
-    // 実際のシステムではDynamoDBに保存
+    // 重複チェック
+    const existingByEmail = await db.findAthleteByEmail(email);
+    const existingByHalshare = await db.findAthleteByHalshareId(halshare_id);
+    
+    if (existingByEmail || existingByHalshare) {
+      return error(400, 'すでに登録されているメールアドレスまたはHalshareIDです');
+    }
+
+    const newAthlete = {
+      email: email.toLowerCase(),
+      name: name,
+      bib_number: bib_number,
+      halshare_id: halshare_id,
+      password_hash: bcrypt.hashSync(password, 10)
+    };
+
+    await db.createAthlete(newAthlete);
+
     console.log('選手アカウント作成:', { email, name, bib_number, halshare_id });
 
     return success({
       message: '選手アカウントを作成しました',
       athlete: {
-        email: email,
-        name: name,
-        bib_number: bib_number,
-        halshare_id: halshare_id,
+        email: newAthlete.email,
+        name: newAthlete.name,
+        bib_number: newAthlete.bib_number,
+        halshare_id: newAthlete.halshare_id,
         created_at: new Date().toISOString()
       }
     });

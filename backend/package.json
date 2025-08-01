@@ -3,10 +3,27 @@
   "version": "1.0.0",
   "main": "handler.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "setup": "chmod +x scripts/setup-dynamodb.sh && ./scripts/setup-dynamodb.sh",
+    "dynamodb:start": "docker start dynamodb-local || docker run -d --name dynamodb-local -p 8000:8000 amazon/dynamodb-local",
+    "dynamodb:stop": "docker stop dynamodb-local",
+    "dynamodb:logs": "docker logs dynamodb-local",
+    "dev": "npm run dynamodb:start && npx sls offline",
+    "dev:clean": "npm run dynamodb:stop && npm run setup && npx sls offline",
+    "deploy": "serverless deploy"
   },
-  "keywords": [],
+  "keywords": ["triathlon", "temperature", "dynamodb"],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "トライアスロン体表温システム バックエンド (DynamoDB Docker版)",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "papaparse": "^5.4.1",
+    "jsonwebtoken": "^9.0.2",
+    "aws-sdk": "^2.1691.0"
+  },
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-offline": "^13.8.0"
+  }
 }

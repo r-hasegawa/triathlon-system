@@ -1,13 +1,12 @@
-const AWS = require('aws-sdk');
 const bcrypt = require('bcryptjs');
 const { success, error } = require('./utils/response');
 const { sign } = require('./utils/jwt');
-
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+const db = require('./data/dynamodb');
 
 exports.login = async (event) => {
   try {
-    const { email, password } = JSON.parse(event.body || '{}');
+    const body = event.body ? JSON.parse(event.body) : {};
+    const { email, password } = body;
     
     if (!email || !password) {
       return error(400, 'メールアドレスとパスワードが必要です');
@@ -15,22 +14,24 @@ exports.login = async (event) => {
 
     console.log('ログイン試行:', email);
 
-    // テスト用のハードコード認証
-    if (email === 'test@example.com' && password === 'password123') {
+    // DynamoDBから選手情報を取得
+    const athlete = await db.findAthleteByEmail(email);
+
+    if (athlete && bcrypt.compareSync(password, athlete.password_hash)) {
       const token = sign({
-        email: 'test@example.com',
-        halshare_id: '110000021B17',
-        bib_number: '001',
-        name: 'テスト選手'
+        email: athlete.email,
+        halshare_id: athlete.halshare_id,
+        bib_number: athlete.bib_number,
+        name: athlete.name
       });
 
       return success({
         token,
         athlete: {
-          email: 'test@example.com',
-          name: 'テスト選手',
-          bib_number: '001',
-          halshare_id: '110000021B17'
+          email: athlete.email,
+          name: athlete.name,
+          bib_number: athlete.bib_number,
+          halshare_id: athlete.halshare_id
         }
       });
     }
@@ -39,14 +40,15 @@ exports.login = async (event) => {
 
   } catch (err) {
     console.error('ログインエラー:', err);
-    return error(500, 'サーバーエラーが発生しました');
+    return error(500, 'サーバーエラーが発生しました: ' + err.message);
   }
 };
 
-// 管理者ログイン関数を追加
+// 管理者ログイン
 exports.adminLogin = async (event) => {
   try {
-    const { username, password } = JSON.parse(event.body || '{}');
+    const body = event.body ? JSON.parse(event.body) : {};
+    const { username, password } = body;
     
     if (!username || !password) {
       return error(400, 'ユーザー名とパスワードが必要です');
@@ -81,6 +83,6 @@ exports.adminLogin = async (event) => {
 
   } catch (err) {
     console.error('管理者ログインエラー:', err);
-    return error(500, 'サーバーエラーが発生しました');
+    return error(500, 'サーバーエラーが発生しました: ' + err.message);
   }
 };
